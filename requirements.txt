@@ -3,6 +3,6 @@ uvicorn
 sqlalchemy
 argon2-cffi
 pyjwt
-psycopg2-binary
+psycopg[binary]
 qrcode
 pywebpush
