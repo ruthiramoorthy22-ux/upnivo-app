@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#071433" />
+    <title>Delete your account – UPNIVO INTERN</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        font-family: system-ui, sans-serif;
+        background: #f4f7fb;
+        color: #1b2430;
+        margin: 0;
+        padding: 16px;
+        display: grid;
+        place-items: start center;
+        min-height: 100vh;
+        line-height: 1.5;
+      }
+      .card {
+        width: min(100%, 520px);
+        background: white;
+        border-radius: 18px;
+        box-shadow: 0 12px 30px rgba(20, 32, 61, 0.12);
+        padding: 24px;
+      }
+      h1 { margin-top: 0; font-size: 1.5rem; }
+      h2 { font-size: 1.05rem; margin: 22px 0 6px; }
+      ul { margin: 6px 0; padding-left: 20px; }
+      label { display: block; margin: 16px 0 8px; font-weight: 600; }
+      input[type="email"], input[type="password"] {
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid #8a9bb3;
+        border-radius: 10px;
+        font-size: 1rem;
+      }
+      .confirm { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; margin-top: 18px; }
+      .confirm input { width: 22px; height: 22px; margin-top: 2px; flex-shrink: 0; }
+      button {
+        width: 100%;
+        min-height: 48px;
+        margin-top: 18px;
+        padding: 12px 18px;
+        border: none;
+        border-radius: 10px;
+        background: #b42318;
+        color: white;
+        font-size: 1rem;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button[disabled] { opacity: .6; cursor: progress; }
+      :focus-visible { outline: 3px solid #0b5fff; outline-offset: 2px; }
+      .status { margin-top: 16px; min-height: 24px; color: #0a7d3d; font-weight: 600; }
+      .error { color: #b42318; }
+      .small { font-size: .9rem; color: #46556a; }
+      a { color: #0b5fff; }
+      @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Delete your UPNIVO INTERN account</h1>
+      <p>
+        This page lets you delete your account for the <strong>UPNIVO INTERN</strong> app (Upnivo, Android package
+        <code>com.upnivo.app</code>) and the website, without installing the app. You can also delete your account inside the app:
+        <strong>Profile → Delete my account</strong>.
+      </p>
+
+      <h2>What is deleted</h2>
+      <ul>
+        <li>Your profile: name, email, mobile number, college, degree, department, year, city, state, gender, about text and photo.</li>
+        <li>Your password. The account is closed and can no longer sign in.</li>
+        <li>Your notifications and your push-notification registrations.</li>
+        <li>Your task submissions' content: links, GitHub and demo links, notes and screenshots (screenshots stored on our server are removed).</li>
+      </ul>
+
+      <h2>What is kept, and why</h2>
+      <ul>
+        <li>Minimal enrollment records (which internship, plan, status) so that issued certificates and reports stay consistent.</li>
+        <li>Certificate-fee payment records (reference, amount, status) needed for accounting and refunds.</li>
+        <li>Security and audit log entries.</li>
+      </ul>
+      <p class="small">These records are no longer linked to your name, email or phone number.</p>
+
+      <p><strong>Deletion is immediate and cannot be undone.</strong></p>
+
+      <form id="delete-form">
+        <label for="email">Email address</label>
+        <input type="email" id="email" name="email" autocomplete="email" required />
+
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required />
+
+        <label class="confirm" for="confirm">
+          <input type="checkbox" id="confirm" required />
+          <span>I understand that my account and the data listed above will be permanently deleted.</span>
+        </label>
+
+        <button type="submit" id="submit">Delete my account</button>
+      </form>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+      <p class="small">
+        Cannot remember your password? See the contact details on the Help page of the app:
+        <a href="/#info/help">Help &amp; support</a>.
+      </p>
+    </main>
+
+    <script>
+      const form = document.getElementById('delete-form');
+      const status = document.getElementById('status');
+      const submit = document.getElementById('submit');
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        status.className = 'status';
+        status.textContent = 'Processing...';
+        submit.disabled = true;
+        const email = document.getElementById('email').value.trim();
+        const password = document.getElementById('password').value;
+
+        try {
+          const response = await fetch('/api/account-delete-request', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+          });
+
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(typeof data.detail === 'string' ? data.detail : 'Unable to delete your account right now.');
+          }
+
+          status.textContent = data.message || 'Your account has been deleted.';
+          form.reset();
+        } catch (error) {
+          status.textContent = error.message;
+          status.classList.add('error');
+        } finally {
+          submit.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

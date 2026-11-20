@@ -1,11 +1,13 @@
-import os, threading, secrets, io, re, uuid, json, hmac, base64, html, urllib.request, urllib.error, datetime as dt, jwt
+import os, threading, secrets, io, re, uuid, json, hmac, hashlib, logging, base64, html, urllib.request, urllib.error, datetime as dt, jwt, time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse, Response, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, RedirectResponse, JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, inspect, text, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from argon2 import PasswordHasher
 from programs import PROGRAMS, METHOD, PLAN_LABEL
@@ -14,12 +16,34 @@ try:
 except Exception:
     qrcode = None
 
-DB = os.getenv("DATABASE_URL", "sqlite:///./upnivo.db")
-SECRET = os.getenv("SECRET_KEY", "dev-secret-change-me")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "skillforgelearning22@gmail.com").lower()
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+DB = os.getenv("DATABASE_URL")
+if not DB and APP_ENV == "production":
+    raise RuntimeError("DATABASE_URL must be set when APP_ENV=production")
+def normalize_db_url(url):
+    """Hosts hand out postgres:// or postgresql:// URLs. SQLAlchemy 2 rejects the first and may pick a driver that is not installed for the
+    second, so both are mapped to the psycopg 3 driver listed in requirements.txt. URLs that already name a driver are left alone."""
+    if url.startswith("postgres://"): url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"): url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+DB = normalize_db_url(DB or "sqlite:///./upnivo.db")
+SECRET = os.getenv("SECRET_KEY") or secrets.token_urlsafe(32)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@yourdomain.com").lower()
 TZ_MIN = int(os.getenv("TZ_OFFSET_MIN", "330"))  # IST by default
 UPLOADS = Path(os.getenv("UPLOAD_DIR", "uploads")); UPLOADS.mkdir(parents=True, exist_ok=True)
-engine = create_engine(DB, connect_args={"check_same_thread": False} if DB.startswith("sqlite") else {})
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", str(4_000_000)))
+UPLOAD_STORAGE = os.getenv("UPLOAD_STORAGE_PROVIDER", "local").lower()
+UPLOAD_PUBLIC_BASE_URL = (os.getenv("UPLOAD_PUBLIC_BASE_URL") or "").rstrip("/")
+if APP_ENV == "production" and UPLOAD_STORAGE == "local":
+    raise RuntimeError("UPLOAD_STORAGE_PROVIDER must be 's3' or 'cloudinary' when APP_ENV=production")
+ALLOWED_UPLOAD_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8000,http://localhost:3000,https://localhost").split(",") if o.strip()]
+engine = create_engine(DB, connect_args={"check_same_thread": False} if DB.startswith("sqlite") else {}, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 ph = PasswordHasher()
@@ -33,6 +57,8 @@ class User(Base):
     city = Column(String(80), default=""); state = Column(String(80), default=""); country = Column(String(80), default="India")
     gender = Column(String(20), default=""); pw = Column(String(300)); photo = Column(String(200), default="")
     role = Column(String(10), default="student"); active = Column(Boolean, default=True)
+    deletion_status = Column(String(20), default="active")
+    deleted_at = Column(DateTime)
     created = Column(DateTime, default=dt.datetime.utcnow)
 
 class Internship(Base):
@@ -77,12 +103,20 @@ class Submission(Base):
     status = Column(String(20), default="Submitted")  # Submitted | Approved | Rework
     feedback = Column(Text, default=""); created = Column(DateTime, default=dt.datetime.utcnow)
 
-class Payment(Base):  # certificate payment (UPI, verified by admin)
+class Payment(Base):  # certificate payment: UPI (verified by admin) or Razorpay (confirmed by the gateway)
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True)
     application_id = Column(Integer, ForeignKey("applications.id"), index=True); amount = Column(Integer, default=0)
-    utr = Column(String(60)); status = Column(String(12), default="Pending")  # Pending | Paid | Rejected
+    utr = Column(String(60)); status = Column(String(12), default="Pending")  # Created | Expired | Pending | Paid | Rejected | Refunded
     note = Column(Text, default=""); created = Column(DateTime, default=dt.datetime.utcnow)
+    # Added in Phase 6 (nullable, added to existing databases by migrate()); legacy rows keep working with these empty
+    provider = Column(String(12)); order_id = Column(String(60)); rzp_payment_id = Column(String(60))
+    currency = Column(String(3)); amount_paise = Column(Integer); refunded_paise = Column(Integer, default=0); updated = Column(DateTime)
+
+class WebhookEvent(Base):  # one row per processed Razorpay webhook delivery, so retries are never applied twice
+    __tablename__ = "webhook_events"
+    id = Column(Integer, primary_key=True)
+    event_id = Column(String(80), unique=True, nullable=False); event = Column(String(60)); created = Column(DateTime, default=dt.datetime.utcnow)
 
 class Setting(Base):
     __tablename__ = "settings"
@@ -110,27 +144,87 @@ Base.metadata.create_all(engine)
 
 def migrate():  # adds new columns to a database created by an older version
     insp = inspect(engine)
-    want = {"users": {"photo": "VARCHAR(200)"},
+    want = {"users": {"photo": "VARCHAR(200)", "deletion_status": "VARCHAR(20)", "deleted_at": "TIMESTAMP"},
             "internships": {"method": "TEXT", "roles": "TEXT", "tools": "TEXT", "final": "TEXT", "roadmap": "TEXT", "plans": "VARCHAR(20)", "image": "VARCHAR(300)"},
             "applications": {"offer_date": "TIMESTAMP", "offer_ref": "VARCHAR(40)", "start_date": "VARCHAR(12)", "months": "INTEGER", "offer_note": "TEXT", "offer_snap": "TEXT"},
             "tasks": {"months": "INTEGER", "theme": "VARCHAR(120)", "brief": "TEXT", "image": "VARCHAR(300)", "resource": "VARCHAR(400)"},
-            "submissions": {"image": "VARCHAR(300)", "github": "VARCHAR(500)", "video": "VARCHAR(500)"}}
+            "submissions": {"image": "VARCHAR(300)", "github": "VARCHAR(500)", "video": "VARCHAR(500)"},
+            "payments": {"provider": "VARCHAR(12)", "order_id": "VARCHAR(60)", "rzp_payment_id": "VARCHAR(60)", "currency": "VARCHAR(3)",
+                         "amount_paise": "INTEGER", "refunded_paise": "INTEGER", "updated": "TIMESTAMP"}}
     with engine.begin() as c:
         for t, cols in want.items():
             have = {x["name"] for x in insp.get_columns(t)}
             for n, ty in cols.items():
                 if n not in have: c.execute(text(f"ALTER TABLE {t} ADD COLUMN {n} {ty}"))
+    # payment integrity indexes. Each runs on its own so that an index which cannot be built on legacy data never stops start-up.
+    for name, ddl in (("ix_payments_order_id", "CREATE INDEX IF NOT EXISTS ix_payments_order_id ON payments (order_id)"),
+                      ("uq_payments_rzp_payment_id", "CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_rzp_payment_id ON payments (rzp_payment_id)"),
+                      ("uq_payments_one_open_per_app", "CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_one_open_per_app ON payments (application_id) WHERE status IN ('Created', 'Pending')")):
+        try:
+            with engine.begin() as c: c.execute(text(ddl))
+        except Exception as e: logging.getLogger("upnivo.payments").warning("Could not create index %s (%s); application-level checks still apply", name, type(e).__name__)
 migrate()
 from fastapi.middleware.gzip import GZipMiddleware
 app = FastAPI(title="UPNIVO INTERN API")
-from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_middleware(GZipMiddleware, minimum_size=800)  # smaller downloads = faster app
+RATE_LIMITS = {
+    "/api/register": (5, 60),
+    "/api/login": (5, 60),
+    "/api/admin/login": (5, 60),
+    "/api/upload": (10, 60),
+    "/api/admin/announce": (20, 60),
+    "/api/me/delete": (3, 300),
+    "/api/account-delete-request": (3, 300),
+    "/api/applications/{id}/razorpay-order": (10, 60),
+    "/api/applications/{id}/razorpay-verify": (20, 60),
+    "/api/applications/{id}/pay": (10, 60),
+}
+CLIENT_RATE_LIMIT = {}
+
+
+def client_ip(request: Request):
+    return (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() or request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def protect_requests(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        limit = RATE_LIMITS.get(path) or RATE_LIMITS.get(re.sub(r"/\d+(?=/|$)", "/{id}", path))
+        if limit:
+            key = f"{client_ip(request)}:{path}"
+            now = time.monotonic()
+            hits = CLIENT_RATE_LIMIT.setdefault(key, [])
+            hits[:] = [x for x in hits if now - x < limit[1]]
+            if len(hits) >= limit[0]:
+                return JSONResponse({"detail": "Too many requests. Please wait and try again."}, status_code=429)
+            hits.append(now)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def cache_static(request, call_next):
     r = await call_next(request)
     p = request.url.path
     if p.startswith("/static/covers") or p.startswith("/uploads") or p.endswith((".png", ".svg")): r.headers["Cache-Control"] = "public, max-age=86400"
     elif p.startswith("/api/"): r.headers["Cache-Control"] = "no-store"
+    if p.startswith("/delete-account") or p.startswith("/privacy") or p.startswith("/terms"):
+        r.headers["Cache-Control"] = "no-store"
+    # Phase 10 security headers. A Content-Security-Policy is intentionally not set yet: the pages use inline scripts/handlers and
+    # Razorpay Checkout loads third-party frames, so a CSP must be tested against a real test-mode payment before it is enforced.
+    r.headers.setdefault("X-Content-Type-Options", "nosniff")
+    r.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    r.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    r.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(self)")
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https":
+        r.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return r
 
 def db():
@@ -165,7 +259,7 @@ try: from pywebpush import webpush, WebPushException
 except Exception: webpush = None
 def _push_send(subs, payload):  # runs in a background thread so the app stays fast
     for ep, k1, k2 in subs:
-        try: webpush(subscription_info={"endpoint": ep, "keys": {"p256dh": k1, "auth": k2}}, data=json.dumps(payload), vapid_private_key=VAPID_PRIV, vapid_claims={"sub": "mailto:" + (os.getenv("ADMIN_EMAIL") or "skillforgelearning22@gmail.com")})
+        try: webpush(subscription_info={"endpoint": ep, "keys": {"p256dh": k1, "auth": k2}}, data=json.dumps(payload), vapid_private_key=VAPID_PRIV, vapid_claims={"sub": "mailto:" + ADMIN_EMAIL})
         except Exception as e:
             if "410" in str(e) or "404" in str(e):
                 d = SessionLocal()
@@ -186,34 +280,130 @@ def fee(s):
     try: return max(0, int(float(setting(s, "cert_fee"))))
     except ValueError: return 0
 RZP_KEY, RZP_SECRET, RZP_WH = os.getenv("RAZORPAY_KEY_ID", ""), os.getenv("RAZORPAY_KEY_SECRET", ""), os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+paylog = logging.getLogger("upnivo.payments")
+RZP_MODE = "live" if RZP_KEY.startswith("rzp_live_") else "test" if RZP_KEY.startswith("rzp_test_") else ("unset" if not RZP_KEY else "unknown")
+if RZP_KEY and APP_ENV != "production" and RZP_MODE == "live": paylog.warning("Razorpay LIVE keys are configured while APP_ENV=%s. Use rzp_test_ keys for development and testing.", APP_ENV)
+if RZP_KEY and APP_ENV == "production" and RZP_MODE == "test": paylog.warning("Razorpay TEST keys are configured while APP_ENV=production. Real payments will not work.")
+CURRENCY = "INR"; MAX_CERT_FEE_RS = 100000; MAX_WEBHOOK_BYTES = 262144
+ORDER_TTL = dt.timedelta(hours=int(os.getenv("RAZORPAY_ORDER_TTL_HOURS", "24")))
 def rzp_on(): return bool(RZP_KEY and RZP_SECRET)
 def rzp_request(path, payload):  # plain HTTPS call to Razorpay (no extra library needed)
     auth = base64.b64encode(f"{RZP_KEY}:{RZP_SECRET}".encode()).decode()
     req = urllib.request.Request("https://api.razorpay.com/v1" + path, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Authorization": "Basic " + auth})
     try: return json.loads(urllib.request.urlopen(req, timeout=20).read())
-    except urllib.error.HTTPError as e: raise HTTPException(502, "Razorpay error: " + e.read().decode()[:200])
-    except Exception: raise HTTPException(502, "Could not reach Razorpay")
-def rzp_sig_ok(msg, sig, secret): return bool(secret) and hmac.compare_digest(hmac.new(secret.encode(), msg.encode(), "sha256").hexdigest(), sig or "")
+    except urllib.error.HTTPError as e:  # the gateway's reply is logged on the server only, never sent to the browser
+        paylog.error("Razorpay HTTP %s for %s: %s", e.code, path, e.read().decode("utf-8", "replace")[:200]); raise HTTPException(502, "The payment service could not process this request. Please try again later.")
+    except Exception as e:
+        paylog.error("Razorpay request failed for %s: %s", path, type(e).__name__); raise HTTPException(502, "Could not reach the payment service. Please try again.")
+def rzp_sig_ok(msg, sig, secret):  # HMAC-SHA256 over the exact bytes; compared as bytes so a non-ASCII header cannot raise
+    if not secret or not sig: return False
+    m = msg if isinstance(msg, bytes) else msg.encode()
+    return hmac.compare_digest(hmac.new(secret.encode(), m, "sha256").hexdigest().encode(), str(sig).encode("utf-8", "replace"))
 TPL_DEFAULTS = {
     "offer_intro": "Congratulations! We are delighted to offer you an internship with UPNIVO INTERN as a {internship} Intern. After reviewing your enrollment, we believe you will learn and contribute well in this programme.",
     "offer_terms": "Submit only your own original work and follow the code of conduct.\nKeep platform and project information confidential unless told otherwise.\nUPNIVO INTERN may end the internship in case of long inactivity or misconduct.",
     "offer_closing": "We wish you great learning ahead. Welcome aboard!",
     "signer_name": "", "signer_title": "Authorised Signatory", "signature": "/static/signature.png",
+    "signature2": "", "signer2_name": "", "signer2_title": "Authorized Signatory", "offer_pad_top": "40", "offer_pad_bottom": "20",
     "offer_footer": "Issued digitally by the UPNIVO INTERN platform",
+    "offer_template_image": "",
     "cert_heading": "Internship Certificate", "cert_sub": "CERTIFICATE OF COMPLETION",
     "cert_body": "has successfully completed the {plan} {internship} internship at UPNIVO INTERN by completing all {tasks} assigned tasks with dedication and quality.",
-    "cert_footer": "This certificate can be verified with the Certificate ID by UPNIVO INTERN."}
+    "cert_footer": "This certificate can be verified with the Certificate ID by UPNIVO INTERN.",
+    "cert_template_image": ""}
 DEFAULTS.update(TPL_DEFAULTS)
 def tpl(s): return {k: setting(s, k) for k in TPL_DEFAULTS}
-EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+
+
+def _safe_upload_file_name(ext: str) -> str:
+    safe_ext = re.sub(r"[^a-z0-9]", "", (ext or "").lower())
+    if not safe_ext:
+        raise HTTPException(400, "Unsupported or missing file extension")
+    return f"{uuid.uuid4().hex}.{safe_ext}"
+
+
+def persist_upload(raw: bytes, ext: str) -> str:
+    safe_ext = re.sub(r"[^a-z0-9]", "", (ext or "").lower())
+    if safe_ext not in set(ALLOWED_UPLOAD_TYPES.values()):
+        raise HTTPException(400, "Unsupported upload image type")
+
+    filename = _safe_upload_file_name(safe_ext)
+    if UPLOAD_STORAGE == "cloudinary":
+        cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+        api_key = os.getenv("CLOUDINARY_API_KEY")
+        api_secret = os.getenv("CLOUDINARY_API_SECRET")
+        if not (cloud_name and api_key and api_secret):
+            raise HTTPException(503, "Cloudinary upload storage is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET.")
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret, secure=True)
+            public_id = filename.rsplit(".", 1)[0]
+            result = cloudinary.uploader.upload(io.BytesIO(raw), folder=os.getenv("CLOUDINARY_FOLDER", "uploads"), resource_type="image", public_id=public_id, overwrite=False)
+            url = result.get("secure_url") or result.get("url")
+            if not url:
+                raise ValueError("Cloudinary upload response did not include a URL")
+            return str(url)
+        except Exception as exc:
+            logging.getLogger("upnivo.uploads").error("Cloudinary upload failed: %s", type(exc).__name__); raise HTTPException(500, "Image upload failed. Please try again later.") from exc
+
+    if UPLOAD_STORAGE == "s3":
+        bucket = os.getenv("AWS_S3_BUCKET")
+        if not bucket:
+            raise HTTPException(503, "S3 upload storage is not configured. Set AWS_S3_BUCKET or use local uploads.")
+        try:
+            import boto3
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                region_name=os.getenv("AWS_REGION", "us-east-1"),
+                endpoint_url=os.getenv("AWS_S3_ENDPOINT_URL") or None,
+            )
+            s3.put_object(Bucket=bucket, Key=f"uploads/{filename}", Body=raw, ContentType=f"image/{safe_ext}")
+            if UPLOAD_PUBLIC_BASE_URL:
+                return f"{UPLOAD_PUBLIC_BASE_URL.rstrip('/')}/uploads/{filename}"
+            payload = os.getenv("AWS_S3_PUBLIC_URL")
+            if payload:
+                return f"{payload.rstrip('/')}/uploads/{filename}"
+            return f"https://{bucket}.s3.amazonaws.com/uploads/{filename}"
+        except Exception as exc:
+            logging.getLogger("upnivo.uploads").error("S3 upload failed: %s", type(exc).__name__); raise HTTPException(500, "Image upload failed. Please try again later.") from exc
+
+    target = UPLOADS / filename
+    target.write_bytes(raw)
+    return "/uploads/" + filename
+
+
 def save_image(data):
-    m = re.match(r"data:(image/[a-z+]+);base64,(.+)$", data or "", re.S)
-    if not m or m.group(1) not in EXT: raise HTTPException(400, "Upload a PNG, JPG, WEBP or GIF image")
-    raw = base64.b64decode(m.group(2))
-    if len(raw) > 4_000_000: raise HTTPException(413, "Image is too large (max 4 MB)")
-    name = f"{uuid.uuid4().hex}.{EXT[m.group(1)]}"; (UPLOADS / name).write_bytes(raw); return "/uploads/" + name
+    m = re.match(r"data:(image/[a-z0-9.+-]+);base64,(.+)$", data or "", re.S | re.I)
+    if not m or m.group(1).lower() not in ALLOWED_UPLOAD_TYPES: raise HTTPException(400, "Upload a PNG, JPG, WEBP or GIF image")
+    try:
+        raw = base64.b64decode(m.group(2), validate=True)
+    except Exception as exc:
+        raise HTTPException(400, "Invalid base64 image data") from exc
+    if len(raw) > UPLOAD_MAX_BYTES: raise HTTPException(413, f"Image is too large (max {UPLOAD_MAX_BYTES // 1000000} MB)")
+    return persist_upload(raw, ALLOWED_UPLOAD_TYPES[m.group(1).lower()])
+
+
 def clean_url(u):
-    u = (u or "").strip(); return u if re.match(r"^(/uploads/[\w.-]+|https?://\S+)$", u) else ""
+    if not isinstance(u, str):
+        return ""
+    u = u.strip().replace("\\", "/")
+    if not u:
+        return ""
+    if u.startswith("/uploads/"):
+        if ".." in u.split("/") or not re.fullmatch(r"/uploads/[A-Za-z0-9._-]+", u):
+            return ""
+        return u
+    if u.startswith("/static/templates/"):
+        return u if re.fullmatch(r"/static/templates/[A-Za-z0-9._-]+", u) else ""
+    if u.startswith(("http://", "https://")):
+        parsed = urlsplit(u)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or ".." in parsed.path.split("/"):
+            return ""
+        return u
+    return ""
 
 COVER = {"Full Stack": "full-stack", "Python": "python", "Java": "java", "AI/ML": "ai-ml", "UI/UX": "ui-ux", "Cyber Security": "cyber-security",
          "Data Analytics": "data-analytics", "Digital Marketing": "digital-marketing", "Mobile App": "mobile-app", "Cloud DevOps": "cloud-devops"}
@@ -258,14 +448,18 @@ def fix_legacy(s):  # upgrade data from the older version (tasks/applications wi
 @app.on_event("startup")
 def bootstrap():
     s = SessionLocal()
-    pw = os.getenv("ADMIN_PASSWORD") or "ruthira227227"  # change in .env for production
-    adm_u = s.query(User).filter_by(email=ADMIN_EMAIL).first()
-    if not adm_u:
-        s.add(User(name="Administrator", email=ADMIN_EMAIL, pw=ph.hash(pw), role="admin")); s.commit()
-    else:  # keep the admin account in sync with the configured password and role
-        try: ph.verify(adm_u.pw, pw)
-        except Exception: adm_u.pw = ph.hash(pw)
-        adm_u.role = "admin"; s.commit()
+    pw = os.getenv("ADMIN_PASSWORD")
+    if not pw and APP_ENV != "production" and DB.startswith("sqlite"): pw = "change-me-in-production"  # known default: local SQLite development only
+    if not pw:  # never create or reset an admin with a well-known password on a real database
+        paylog.error("ADMIN_PASSWORD is not set: the admin account was NOT created or updated. Set ADMIN_EMAIL and ADMIN_PASSWORD.")
+    else:
+        adm_u = s.query(User).filter_by(email=ADMIN_EMAIL).first()
+        if not adm_u:
+            s.add(User(name="Administrator", email=ADMIN_EMAIL, pw=ph.hash(pw), role="admin")); s.commit()
+        else:  # keep the admin account in sync with the configured password and role
+            try: ph.verify(adm_u.pw, pw)
+            except Exception: adm_u.pw = ph.hash(pw)
+            adm_u.role = "admin"; s.commit()
     if s.query(Internship).count() == 0:
         for t, c in [("Full Stack Web Development (MERN)", "Full Stack"), ("Python Development", "Python"), ("Artificial Intelligence & Machine Learning", "AI/ML"),
                      ("Core Java Programming", "Java"), ("UI/UX Design", "UI/UX"), ("Cyber Security Basics", "Cyber Security")] + NEW_DOMAINS:
@@ -310,7 +504,8 @@ class PayReview(BaseModel): status: str; note: str = ""
 class Settings(BaseModel):
     cert_fee: str = None; upi_id: str = None; upi_name: str = None; offer_intro: str = None; offer_terms: str = None; offer_closing: str = None
     signer_name: str = None; signer_title: str = None; signature: str = None; offer_footer: str = None
-    cert_heading: str = None; cert_sub: str = None; cert_body: str = None; cert_footer: str = None
+    cert_heading: str = None; cert_sub: str = None; cert_body: str = None; cert_footer: str = None; offer_template_image: str = None; cert_template_image: str = None
+    signature2: str = None; signer2_name: str = None; signer2_title: str = None; offer_pad_top: str = None; offer_pad_bottom: str = None
 
 def row(o): return {c.name: getattr(o, c.name) for c in o.__table__.columns if c.name != "pw"}
 
@@ -327,6 +522,8 @@ def register(r: Reg, s: Session = Depends(db)):
 
 def do_login(l, s, need_admin):
     u = s.query(User).filter_by(email=l.email.strip().lower()).first()
+    if not u:
+        raise HTTPException(401, "Invalid email or password")
     try: ph.verify(u.pw, l.password)
     except Exception: raise HTTPException(401, "Invalid email or password")
     if need_admin and u.role != "admin": raise HTTPException(403, "Not an administrator")
@@ -363,14 +560,64 @@ def announce(b: Announce, a: User = Depends(admin), s: Session = Depends(db)):  
     s.commit(); log(s, a.email, f"Announcement '{b.title[:60]}' sent to {len(ids)} student(s)"); return {"sent": len(ids)}
 
 class DelAcc(BaseModel): password: str
+class PublicDeleteRequest(BaseModel): email: str; password: str
+
+
+def delete_local_upload(url):
+    """Delete a file this server stored under /uploads/. Files in Cloudinary/S3 are not touched here (needs provider calls)."""
+    if isinstance(url, str) and url.startswith("/uploads/"):
+        name = Path(url).name
+        if name and name == url[len("/uploads/"):]:
+            try: (UPLOADS / name).unlink(missing_ok=True)
+            except OSError: pass
+
+def purge_user_data(s, u):
+    """Remove personal data linked to the account: push subscriptions, notifications, submission content and local files."""
+    files = [u.photo]
+    s.query(PushSub).filter(PushSub.user_id == u.id).delete(synchronize_session=False)
+    s.query(Notification).filter(Notification.user_id == u.id, Notification.to_admin == False).delete(synchronize_session=False)  # noqa: E712
+    for needle, repl in ((u.email, "deleted-email"), (u.name, "Deleted user")):  # admin-side notifications quote the student's name/email: redact them
+        if needle and len(needle) >= 3:
+            for n in s.query(Notification).filter(Notification.to_admin == True, (Notification.body.contains(needle)) | (Notification.title.contains(needle))):  # noqa: E712
+                n.body = (n.body or "").replace(needle, repl); n.title = (n.title or "").replace(needle, repl)
+    ids = [a.id for a in s.query(Application).filter(Application.user_id == u.id)]
+    if ids:
+        for sub in s.query(Submission).filter(Submission.application_id.in_(ids)):  # rows stay (progress/certificate integrity); the student's content goes
+            files.append(sub.image); sub.link = sub.notes = sub.image = sub.github = sub.video = ""
+    for f in files: delete_local_upload(f)
+
+
+def anonymize_account(u, s=None):
+    if s is not None: purge_user_data(s, u)
+    u.name, u.email, u.mobile, u.college, u.degree, u.department, u.year = "Deleted user", f"deleted{u.id}@deleted.invalid", "", "", "", "", ""
+    u.about = u.city = u.state = u.gender = u.photo = ""
+    u.pw = ph.hash(secrets.token_hex(16))
+    u.active = False
+    u.deletion_status = "completed"
+    u.deleted_at = dt.datetime.utcnow()
+
+
 @app.post("/api/me/delete")
 def delete_me(b: DelAcc, u: User = Depends(current), s: Session = Depends(db)):  # Play Store requires in-app account deletion
     if u.role == "admin": raise HTTPException(400, "Admin account cannot be deleted here")
+    if u.deletion_status == "completed": raise HTTPException(409, "This account has already been deleted")
     try: ph.verify(u.pw, b.password)
     except Exception: raise HTTPException(401, "Wrong password")
-    u.name, u.email, u.mobile, u.college, u.degree, u.department, u.year = "Deleted user", f"deleted{u.id}@deleted.invalid", "", "", "", "", ""
-    u.about = u.city = u.state = u.gender = u.photo = ""; u.pw = ph.hash(secrets.token_hex(16)); u.active = False
-    s.commit(); log(s, "system", f"Account {u.id} deleted by the user"); return {"ok": True}
+    anonymize_account(u, s)
+    s.commit(); log(s, "system", f"Account {u.id} deleted by the user"); return {"ok": True, "status": "completed", "message": "Your account has been deleted."}
+
+
+@app.post("/api/account-delete-request")
+def public_delete_request(b: PublicDeleteRequest, s: Session = Depends(db)):
+    email = b.email.strip().lower()
+    u = s.query(User).filter_by(email=email).first()
+    if not u or not u.active: raise HTTPException(404, "No active account found for that email")
+    if u.deletion_status == "completed": raise HTTPException(409, "This account has already been deleted")
+    try: ph.verify(u.pw, b.password)
+    except Exception: raise HTTPException(401, "Invalid email or password")
+    anonymize_account(u, s)
+    s.commit(); log(s, "system", f"Public account deletion processed for user {u.id}"); return {"ok": True, "status": "completed", "message": "Your account has been deleted."}
+
 
 @app.post("/api/upload")
 def upload(b: Upload, u: User = Depends(current)): return {"url": save_image(b.data)}
@@ -455,14 +702,14 @@ def default_brief(t):  # shown when the admin has not written a detailed explana
 def is_complete(st): return bool(st) and all(x["state"] in ("submitted", "approved") for x in st)
 
 def cert_info(s, a, st):
-    done = is_complete(st); f = fee(s); p = s.query(Payment).filter(Payment.application_id == a.id, Payment.status != "Created").order_by(Payment.id.desc()).first()
+    done = is_complete(st); f = fee(s); p = s.query(Payment).filter(Payment.application_id == a.id, Payment.status.notin_(["Created", "Expired"])).order_by(Payment.id.desc()).first()
     if not done: status = "locked"
     elif f <= 0 or (p and p.status == "Paid"): status = "paid"
     elif p and p.status == "Pending": status = "pending"
     elif p and p.status == "Rejected": status = "rejected"
     else: status = "payable"
-    return {"status": status, "fee": f, "upi_id": setting(s, "upi_id"), "upi_name": setting(s, "upi_name"), "note": p.note if p and p.status == "Rejected" else "",
-            "ref": f"UPN-CERT-{today().year}-{a.id:05d}", "gateway": "razorpay" if rzp_on() else "upi"}
+    return {"status": status, "fee": f, "note": p.note if p and p.status == "Rejected" else "",  # the UPI ID and its name are never sent to students
+            "ref": f"UPN-CERT-{today().year}-{a.id:05d}", "gateway": "razorpay" if rzp_on() else "upi", "methods": {"razorpay": bool(rzp_on()), "gpay": bool(setting(s, "upi_id").strip())}}
 
 @app.get("/api/applications/{aid}/tasks")
 def tasks(aid: int, u: User = Depends(current), s: Session = Depends(db)):
@@ -509,6 +756,7 @@ h3{font:700 14px system-ui;color:#1d3a78;margin:18px 0 6px;text-transform:upperc
 .cert{width:297mm;min-height:210mm;padding:14mm 20mm;text-align:center;background:#fffdf6}.cert .bd{position:absolute;inset:7mm;border:3px solid #c9a227;outline:1px solid #c9a227;outline-offset:-9px}
 .cert img.lg{width:120px;mix-blend-mode:multiply;margin-top:6px}.cert h1{font:700 40px Georgia,serif;color:#0a1a3f;letter-spacing:4px;margin:6px 0 0;text-transform:uppercase}.cert .sub{font:13px system-ui;letter-spacing:5px;color:#9a7b0c;margin-bottom:16px}
 .cert .nm{font:italic 700 44px Georgia,serif;color:#1356c8;margin:10px 0;border-bottom:1.5px solid #c9a227;display:inline-block;padding:0 30px 4px}.cert p{font-size:16px}
+html{-webkit-print-color-adjust:exact;print-color-adjust:exact}.pg.tm h2{font-size:18px}.pg.tm .meta{margin:8px 0 10px;padding-bottom:6px}.pg.tm p{font-size:13px;line-height:1.55;margin:6px 0}.pg.tm table{margin:8px 0}.pg.tm td{padding:5px 12px;font-size:13px}.pg.tm h3{margin:11px 0 3px;font-size:13px}.pg.tm li{font-size:12.5px;line-height:1.5;margin:1px 0}.pg.tm .sg{margin-top:14px}.pg.tm .sg img{height:48px}.pg.tm .seal{width:82px;height:82px;font-size:9px;border-width:2px}
 @page{margin:0}@media print{body{background:#fff}.bar{display:none}.pg{box-shadow:none;margin:0}}"""
 SEAL = '<div class="seal">UPNIVO<br>INTERN<br>OFFICIAL</div>'
 
@@ -517,18 +765,59 @@ def doc_user(s, u, aid):
     if not a or (u.role != "admin" and a.user_id != u.id): raise HTTPException(404, "Not found")
     return a, s.get(User, a.user_id), s.get(Internship, a.internship_id)
 
-def sign_html(base, t):
-    sg = t["signature"]; src = sg if sg.startswith("http") else base + sg; nm, tt = html.escape(t["signer_name"]), html.escape(t["signer_title"])
-    return f'<img src="{src}"><div class="ln"><b>{nm or tt}</b><br>{tt + " · " if nm else ""}UPNIVO INTERN</div>'
+def tpl_src(base, value):  # absolute address of an uploaded template image ("" = no template)
+    url = clean_url(value)
+    if not url: return ""
+    return url if url.startswith(("http://", "https://")) else base + url
+
+def mm_val(v, default):
+    try: return max(0, min(120, int(float(v))))
+    except Exception: return default
+
+def norm_sign(t):  # the two signatures: own uploads only (the first falls back to the built-in sign, the second may stay empty)
+    t["signature"] = clean_url(t.get("signature", "")) or "/static/signature.png"
+    t["signature2"] = clean_url(t.get("signature2", ""))
+    return t
+
+def sign_parts(base, t, n=1):
+    k = "" if n == 1 else "2"
+    img = clean_url(t.get("signature" + k, "")) or ("/static/signature.png" if n == 1 else "")
+    name, title = (t.get(f"signer{k}_name") or "").strip(), (t.get(f"signer{k}_title") or "").strip()
+    if n == 2 and not (img or name): return None  # second signatory not set up: leave that slot empty
+    return {"src": (img if img.startswith("http") else base + img) if img else "", "name": name, "title": title}
+
+def sign_html(base, t, n=1):
+    p = sign_parts(base, t, n)
+    if not p: return ""
+    e = html.escape
+    img = f'<img src="{e(p["src"], quote=True)}" alt="Signature">' if p["src"] else '<div style="height:62px"></div>'
+    sub = (e(p["title"]) + " · " if p["name"] and p["title"] else "") + "UPNIVO INTERN"
+    return f'{img}<div class="ln"><b>{e(p["name"] or p["title"])}</b><br>{sub}</div>'
+
+def sign_tpl(base, t, n):  # signature slot placed on a template image (L = left slot, R = right slot)
+    p = sign_parts(base, t, n)
+    if not p: return ""
+    e = html.escape; side = "L" if n == 1 else "R"
+    img = f'<img src="{e(p["src"], quote=True)}" alt="Signature">' if p["src"] else ""
+    sub = f'<span>{e(p["title"])}</span>' if p["name"] and p["title"] else ""
+    return f'<div class="f si {side}">{img}</div><div class="f sn {side}"><div><b>{e(p["name"] or p["title"])}</b>{sub}</div></div>'
 
 def offer_html(base, t, d):  # t = letter template (text settings), d = details of this offer
     e = html.escape; f = lambda x: x.strftime("%d %B %Y")
     fill = lambda x: e(x).replace("{name}", e(d["name"])).replace("{internship}", e(d["internship"])).replace("{plan}", e(d["plan"])).replace("{start}", f(d["start"]))
     terms = "".join(f"<li>{fill(x)}</li>" for x in t["offer_terms"].split("\n") if x.strip())
     note = f'<p style="background:#f1f6ff;border-left:4px solid #1a73e8;padding:10px 14px;border-radius:6px">{fill(d["note"])}</p>' if d["note"].strip() else ""
+    tm = tpl_src(base, t.get("offer_template_image", ""))
+    if tm:  # the admin's template image is the whole design: letter content is laid out inside it (no built-in header, watermark or footer)
+        pt, pb = mm_val(t.get("offer_pad_top"), 40), mm_val(t.get("offer_pad_bottom"), 20)
+        page = f"background-image:url('{e(tm, quote=True)}');background-size:210mm 297mm;background-repeat:repeat-y;background-position:top center;padding:{pt}mm 18mm {pb}mm;"
+        head, foot = "", f'<div style="text-align:center;font:11px system-ui;color:#5b6987;margin-top:16px">Offer Ref {e(d["ref"])} · {e(t["offer_footer"])}</div>'
+    else:
+        page = ""
+        head = f'<img class="wm" src="{base}/static/logo.png" alt=""><div class="top"><img src="{base}/static/logo.png" alt="UPNIVO INTERN"><div><h1>UPNIVO INTERN</h1><small>LEARN · BUILD · GROW</small></div></div><div class="stripe"></div>'
+        foot = f'<div class="ft">Offer Ref {e(d["ref"])} · {e(t["offer_footer"])}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offer Letter - {e(d['name'])}</title><style>{DOC_CSS}</style></head><body>
-<div class="bar"><button onclick="print()">Print / Save as PDF</button></div><div class="pg"><img class="wm" src="{base}/static/logo.png">
-<div class="top"><img src="{base}/static/logo.png"><div><h1>UPNIVO INTERN</h1><small>LEARN · BUILD · GROW</small></div></div><div class="stripe"></div>
+<div class="bar"><button onclick="print()">Print / Save as PDF</button></div><div class="pg{" tm" if tm else ""}" style="{page}">{head}
 <h2>INTERNSHIP OFFER LETTER</h2><div class="meta"><span><b>Ref No:</b> {e(d['ref'])}</span><span><b>Date:</b> {f(d['date'])}</span></div>
 <p>Dear <b>{e(d['name'])}</b>,<br><span style="font:13px system-ui;color:#475569">{e(d['college'])}</span></p><p>{fill(t['offer_intro'])}</p>{note}
 <table><tr><td>Intern name</td><td>{e(d['name'])}</td></tr><tr><td>Internship</td><td>{e(d['internship'])}</td></tr><tr><td>Plan / Duration</td><td>{e(d['plan'])}</td></tr><tr><td>Total tasks</td><td>{d['n']} daily tasks</td></tr>
@@ -536,7 +825,7 @@ def offer_html(base, t, d):  # t = letter template (text settings), d = details 
 <h3>How your internship works</h3><ol><li>Log in to your UPNIVO INTERN account; your program is now unlocked.</li><li>Open the task of the day, read the steps and complete it.</li><li>Submit your work link or screenshot. The next task opens as soon as you submit.</li>
 <li>Your mentor reviews your work and gives feedback. Fix any task marked for rework.</li><li>After completing all tasks you can unlock your Certificate of Completion.</li></ol>
 <h3>Terms</h3><ul>{terms}</ul><p>{fill(t['offer_closing'])}</p>
-<div class="sg"><div>{sign_html(base, t)}</div>{SEAL}</div><div class="ft">Offer Ref {e(d['ref'])} · {e(t['offer_footer'])}</div></div></body></html>"""
+<div class="sg"><div>{sign_html(base, t, 1)}</div>{SEAL}<div>{sign_html(base, t, 2)}</div></div>{foot}</div></body></html>"""
 
 def offer_details(s, a, st, i, start, note, ref, date):
     n = plan_total(s, a); end = task_date(start, n) if n else start
@@ -560,7 +849,7 @@ def offer_preview(aid: int, b: Offer, request: Request, a_: User = Depends(admin
 
 @app.post("/api/admin/offer-template-preview", response_class=HTMLResponse)
 def template_preview(b: Settings, request: Request, a_: User = Depends(admin), s: Session = Depends(db)):
-    t = {**tpl(s), **b.dict(exclude_none=True)}; t["signature"] = clean_url(t["signature"]) or "/static/signature.png"
+    t = norm_sign({**tpl(s), **b.dict(exclude_none=True)})
     d = {"name": "Sample Student", "college": "Sample College · B.E · CSE", "internship": "Full Stack Web Development (MERN)", "plan": "2 Months (Standard)", "n": 40, "mode": "Online",
          "start": next_monday(), "end": task_date(next_monday(), 40), "ref": "UPN-SAMPLE-00001", "date": dt.datetime.utcnow(), "note": ""}
     return offer_html(str(request.base_url).rstrip("/"), t, d)
@@ -570,15 +859,41 @@ CERT_CSS = """.cert{background:linear-gradient(135deg,#fffdf6,#fff6dd)}.cert .bd
 .cert>*:not(.bd):not(.bd2):not(.ribbon){position:relative}.cert h1{background:linear-gradient(90deg,#0a1a3f,#1356c8);-webkit-background-clip:text;background-clip:text;color:transparent}
 .cert .nm{color:#1356c8;font-size:46px}.cert .meta2{display:flex;justify-content:center;gap:26px;font:13px system-ui;color:#475569;margin-top:6px}.cert .meta2 b{color:#14203f}"""
 
-def cert_html(base, t, d):
+CERT_TPL_CSS = """html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.tpc{position:relative;width:min(297mm,calc(100% - 16px));margin:0 auto 30px;container-type:inline-size;background:#fff;box-shadow:0 10px 40px #0a1a3f33;font-family:Georgia,'Times New Roman',serif;color:#0a1a3f}
+.tpc>img.bgi{display:block;width:100%;height:auto}.tpc .ov{position:absolute;inset:0}
+.tpc .f{position:absolute;display:flex;align-items:center;justify-content:center;text-align:center;overflow:hidden}
+.tpc .nm{left:14%;width:72%;top:31.4%;height:9.4%;font:700 5.4cqw/1.15 Georgia,'Times New Roman',serif}.tpc .nm span{white-space:nowrap;display:inline-block}
+.tpc .bd{left:17%;width:66%;top:43.5%;height:13.3%;font:2.3cqw/1.35 Georgia,'Times New Roman',serif}.tpc .bd span{display:block;width:100%}.tpc .bd b{color:#0a3a9a}
+.tpc .iv{top:63.4%;height:4.4%;font:700 1.75cqw/1.15 Georgia,'Times New Roman',serif;justify-content:flex-start;text-align:left}.tpc .iv span{white-space:nowrap;display:inline-block}
+.tpc .iv1{left:16.2%;width:19%}.tpc .iv2{left:45.6%;width:16.5%}.tpc .iv3{left:73%;width:20%}
+.tpc .si{top:69.4%;height:9.4%;align-items:flex-end}.tpc .si img{max-width:90%;max-height:100%;object-fit:contain;mix-blend-mode:multiply}
+.tpc .sn{top:79.6%;height:11%;align-items:flex-start;font:1.9cqw/1.3 Georgia,'Times New Roman',serif}.tpc .sn b{display:block;font-size:2.2cqw}.tpc .sn span{display:block}
+.tpc .L{left:11%;width:23.2%}.tpc .R{left:66.4%;width:23%}
+@page{size:A4 landscape;margin:0}@media print{.tpc{width:297mm;margin:0;box-shadow:none}}"""
+
+def cert_tpl_html(base, t, d, src):  # certificate drawn on the admin's template: only the variable parts are placed on the image
     e = html.escape; fill = lambda x: e(x).replace("{name}", e(d["name"])).replace("{internship}", e(d["internship"])).replace("{plan}", e(d["plan"])).replace("{tasks}", str(d["tasks"]))
+    clg = f'<div>of <b>{e(d["college"])}</b></div>' if d["college"] else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Certificate - {e(d['name'])}</title><style>{DOC_CSS}{CERT_TPL_CSS}</style></head><body>
+<div class="bar"><button onclick="print()">Print / Save as PDF</button></div><div class="tpc"><img class="bgi" src="{e(src, quote=True)}" alt=""><div class="ov">
+<div class="f nm fit"><span>{e(d['name'])}</span></div><div class="f bd fit"><span>{clg}<div>{fill(t['cert_body'])}</div></span></div>
+<div class="f iv iv1 fit"><span>{e(d['internship'])}</span></div><div class="f iv iv2 fit"><span>{e(d['done'])}</span></div><div class="f iv iv3 fit"><span>{e(d['ref'])}</span></div>
+{sign_tpl(base, t, 1)}{sign_tpl(base, t, 2)}</div></div>
+<script>document.querySelectorAll('.tpc .fit').forEach(function(el){{var c=el.firstElementChild,z=parseFloat(getComputedStyle(el).fontSize),n=0;while((c.offsetWidth>el.clientWidth+1||c.offsetHeight>el.clientHeight+1)&&n++<40){{z*=.94;el.style.fontSize=z+'px'}}}})</script></body></html>"""
+
+def cert_html(base, t, d):
+    src = tpl_src(base, t.get("cert_template_image", ""))
+    if src: return cert_tpl_html(base, t, d, src)
+    e = html.escape; fill = lambda x: e(x).replace("{name}", e(d["name"])).replace("{internship}", e(d["internship"])).replace("{plan}", e(d["plan"])).replace("{tasks}", str(d["tasks"]))
+    right = sign_html(base, t, 2) or f'<div style="font:12px system-ui;text-align:left;color:#475569">Issued on<br><b style="font-size:14px;color:#14203f">{e(d["done"])}</b></div>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Certificate - {e(d['name'])}</title><style>{DOC_CSS}{CERT_CSS}@page{{size:A4 landscape;margin:0}}</style></head><body>
 <div class="bar"><button onclick="print()">Print / Save as PDF</button></div><div class="pg cert"><div class="bd"></div><div class="bd2"></div><div class="ribbon"></div>
-<img class="lg" src="{base}/static/logo.png"><div class="sub">{e(t['cert_sub'])}</div><h1>{e(t['cert_heading'])}</h1>
+<img class="lg" src="{base}/static/logo.png" alt="UPNIVO INTERN"><div class="sub">{e(t['cert_sub'])}</div><h1>{e(t['cert_heading'])}</h1>
 <p style="margin-top:20px">This is to certify that</p><div class="nm">{e(d['name'])}</div>
 <p>of <b>{e(d['college'])}</b><br>{fill(t['cert_body'])}</p>
 <div class="meta2"><span>Internship period: <b>{e(d['start'])} to {e(d['done'])}</b></span><span>Certificate ID: <b>{e(d['ref'])}</b></span></div>
-<div class="sg" style="margin:26px 12mm 0"><div>{sign_html(base, t)}</div>{SEAL}<div style="font:12px system-ui;text-align:left;color:#475569">Issued on<br><b style="font-size:14px;color:#14203f">{e(d['done'])}</b></div></div>
+<div class="sg" style="margin:26px 12mm 0"><div>{sign_html(base, t, 1)}</div>{SEAL}<div>{right}</div></div>
 <p style="font:11px system-ui;color:#7b89a8;margin-top:12px">{e(t['cert_footer'])}</p></div></body></html>"""
 
 @app.get("/api/applications/{aid}/certificate", response_class=HTMLResponse)
@@ -593,19 +908,30 @@ def certificate(aid: int, request: Request, u: User = Depends(current), s: Sessi
 
 @app.post("/api/admin/certificate-preview", response_class=HTMLResponse)
 def cert_preview(b: Settings, request: Request, a_: User = Depends(admin), s: Session = Depends(db)):
-    t = {**tpl(s), **b.dict(exclude_none=True)}; t["signature"] = clean_url(t["signature"]) or "/static/signature.png"
+    t = norm_sign({**tpl(s), **b.dict(exclude_none=True)})
     d = {"name": "Sample Student", "college": "Sample College of Engineering", "internship": "Full Stack Web Development (MERN)", "plan": "2-month", "tasks": 40,
          "start": "01 January 2027", "done": "28 February 2027", "ref": "UPN-CERT-2027-00001"}
     return cert_html(str(request.base_url).rstrip("/"), t, d)
 
 @app.post("/api/admin/applications/{aid}/send-payment")
-def send_payment(aid: int, a_: User = Depends(admin), s: Session = Depends(db)):  # sends the certificate fee + UPI details to the student
+def send_payment(aid: int, a_: User = Depends(admin), s: Session = Depends(db)):  # tells the student the certificate fee (no UPI details are ever put in the message)
     x = s.get(Application, aid)
     if not x: raise HTTPException(404, "Not found")
-    f, upi = fee(s), setting(s, "upi_id")
-    body = f"Certificate fee: Rs {f}." + (f" Pay by UPI to {upi} ({setting(s, 'upi_name')}) and enter the UTR number in your program page." if upi else " Open your program page to pay.") if f else "Your certificate is free. Open your program page."
+    f = fee(s)
+    body = f"Certificate fee: Rs {f}. Open your program page and pay securely with Razorpay or GPay." if f else "Your certificate is free. Open your program page."
     notify(s, "Certificate payment details", body, user_id=x.user_id, link=f"program/{x.id}"); s.commit(); log(s, a_.email, f"Payment details sent for application {aid}")
     return {"ok": True}
+
+def gpay_links(s, amount, note):  # opens the GPay app with the payee filled in; the student never sees the UPI ID or name on screen
+    q = f"pa={quote(setting(s, 'upi_id').strip(), safe='@')}&pn={quote(setting(s, 'upi_name') or 'UPNIVO INTERN')}&am={int(amount)}.00&cu=INR&tn={quote(note[:40])}"
+    return {"android": f"intent://upi/pay?{q}#Intent;scheme=upi;package=com.google.android.apps.nbu.paisa.user;end", "ios": f"gpay://upi/pay?{q}"}
+
+@app.post("/api/applications/{aid}/gpay-link")
+def gpay_link(aid: int, u: User = Depends(current), s: Session = Depends(db)):
+    a = own_app(s, u, aid, True); info = cert_info(s, a, task_states(s, a))
+    if info["status"] not in ("payable", "rejected"): raise HTTPException(409, "Certificate payment is not needed right now")
+    if not info["methods"]["gpay"]: raise HTTPException(400, "GPay payment is not available right now")
+    return gpay_links(s, info["fee"], "Certificate " + info["ref"])
 
 @app.post("/api/applications/{aid}/pay")
 def pay(aid: int, b: Pay, u: User = Depends(current), s: Session = Depends(db)):
@@ -613,52 +939,126 @@ def pay(aid: int, b: Pay, u: User = Depends(current), s: Session = Depends(db)):
     if info["status"] == "locked": raise HTTPException(403, "Complete all tasks first")
     if info["status"] == "paid": raise HTTPException(409, "Certificate is already unlocked")
     if info["status"] == "pending": raise HTTPException(409, "Your payment is already waiting for verification")
-    if len(b.utr.strip()) < 6: raise HTTPException(400, "Enter the UPI transaction / UTR number")
-    s.add(Payment(application_id=aid, amount=info["fee"], utr=b.utr.strip()[:60]))
-    notify(s, "Certificate payment submitted", f"{u.name} paid ₹{info['fee']} (UTR {b.utr.strip()[:20]}). Please verify.", admin_=True, link="payments")
-    s.commit(); return {"ok": True}
+
+    utr = b.utr.strip()[:60]
+    if len(utr) < 6: raise HTTPException(400, "Enter the UPI transaction / UTR number")
+    if s.query(Payment).filter(func.lower(Payment.utr) == utr.lower(), Payment.status.in_(["Pending", "Paid"])).first(): raise HTTPException(409, "This transaction number has already been submitted")
+    s.add(Payment(application_id=aid, amount=info["fee"], utr=utr, provider="upi", currency=CURRENCY, amount_paise=info["fee"] * 100, updated=dt.datetime.utcnow()))
+    notify(s, "Certificate payment submitted", f"{u.name} paid ₹{info['fee']} (UTR {utr[:20]}). Please verify.", admin_=True, link="payments")
+    try: s.commit()
+    except IntegrityError: s.rollback(); raise HTTPException(409, "Your payment is already waiting for verification")
+    return {"ok": True}
 
 class RzpVerify(BaseModel): razorpay_order_id: str; razorpay_payment_id: str; razorpay_signature: str
 
-def mark_paid(s, p, payment_id):
-    p.status, p.utr, p.note = "Paid", payment_id, "Razorpay"; ap = s.get(Application, p.application_id); st = s.get(User, ap.user_id)
+def is_rzp(p): return p.provider == "razorpay" or p.note == "Razorpay" or (p.utr or "").startswith(("order_", "pay_"))  # also recognises rows saved before Phase 6
+def expected_paise(p): return p.amount_paise if p.amount_paise else (p.amount or 0) * 100
+def find_rzp_payment(s, order_id, aid=None):
+    q = s.query(Payment).filter(((Payment.order_id == order_id) | (Payment.order_id.is_(None) & (Payment.utr == order_id))))
+    if aid is not None: q = q.filter(Payment.application_id == aid)
+    return q.order_by(Payment.id.desc()).first()
+
+def settle_paid(s, p, payment_id):
+    """Created/Expired -> Paid as ONE conditional UPDATE, so the browser callback and the webhook can never both apply it. Returns True only for the caller that won."""
+    n = s.query(Payment).filter(Payment.id == p.id, Payment.status.in_(["Created", "Expired"])).update(
+        {"status": "Paid", "rzp_payment_id": payment_id, "utr": payment_id, "note": "Razorpay", "provider": "razorpay", "updated": dt.datetime.utcnow()}, synchronize_session=False)
+    if n != 1: return False
+    s.refresh(p); ap = s.get(Application, p.application_id); st = s.get(User, ap.user_id)
+    dup = s.query(Payment).filter(Payment.application_id == p.application_id, Payment.status == "Paid", Payment.id != p.id).count()
+    if dup:  # money was taken twice for the same certificate: keep both records and tell the admin to refund one in Razorpay
+        p.note = "Razorpay - DUPLICATE payment, refund required"
+        notify(s, "Duplicate certificate payment", f"{st.name} paid twice for application {ap.id} ({payment_id}). Refund one payment in the Razorpay dashboard.", admin_=True, link="payments")
     notify(s, "Certificate unlocked 🎓", "Payment received. Open your program to view and download your certificate.", user_id=ap.user_id, link=f"program/{ap.id}")
     notify(s, "Certificate payment received", f"{st.name} paid ₹{p.amount} via Razorpay ({payment_id})", admin_=True, link="payments")
+    return True
 
 @app.post("/api/applications/{aid}/razorpay-order")
 def rzp_order(aid: int, u: User = Depends(current), s: Session = Depends(db)):
     if not rzp_on(): raise HTTPException(400, "Online payment is not enabled")
     a = own_app(s, u, aid, True); info = cert_info(s, a, task_states(s, a))
     if info["status"] not in ("payable", "rejected"): raise HTTPException(409, "Certificate payment is not needed right now")
-    o = rzp_request("/orders", {"amount": info["fee"] * 100, "currency": "INR", "receipt": info["ref"], "notes": {"application": str(aid)}})
-    s.add(Payment(application_id=aid, amount=info["fee"], utr=o["id"], status="Created")); s.commit()
-    return {"order_id": o["id"], "amount": o["amount"], "key_id": RZP_KEY, "name": u.name, "email": u.email, "contact": u.mobile, "ref": info["ref"]}
+    rs = info["fee"]  # the amount ALWAYS comes from the server-side setting, never from the request
+    if not 1 <= rs <= MAX_CERT_FEE_RS: raise HTTPException(400, "Online payment is not available for this certificate")
+    paise, now = rs * 100, dt.datetime.utcnow()
+    s.query(Payment).filter(Payment.application_id == aid, Payment.status == "Created", Payment.created < now - ORDER_TTL).update({"status": "Expired", "updated": now}, synchronize_session=False); s.commit()
+    open_ = s.query(Payment).filter(Payment.application_id == aid, Payment.status.in_(["Created", "Pending"])).order_by(Payment.id.desc()).first()
+    if open_ and (open_.status == "Pending" or not is_rzp(open_)): raise HTTPException(409, "A certificate payment is already waiting for verification")
+    if open_:  # the student closed the checkout earlier: hand back the same unpaid order instead of blocking them
+        if expected_paise(open_) == paise: return {"order_id": open_.order_id or open_.utr, "amount": paise, "key_id": RZP_KEY, "name": u.name, "email": u.email, "contact": u.mobile, "ref": info["ref"]}
+        s.query(Payment).filter(Payment.id == open_.id, Payment.status == "Created").update({"status": "Expired", "updated": now}, synchronize_session=False); s.commit()  # fee changed since: start a fresh order
+    o = rzp_request("/orders", {"amount": paise, "currency": CURRENCY, "receipt": info["ref"], "notes": {"application": str(aid), "user": str(u.id)}})
+    if o.get("amount") != paise or o.get("currency") != CURRENCY or not str(o.get("id", "")).startswith("order_"):
+        paylog.error("Razorpay order response did not match the request for application %s", aid); raise HTTPException(502, "The payment service returned an unexpected response. Please try again.")
+    s.add(Payment(application_id=aid, amount=rs, utr=o["id"], order_id=o["id"], provider="razorpay", status="Created", currency=CURRENCY, amount_paise=paise, updated=now))
+    try: s.commit()
+    except IntegrityError: s.rollback(); raise HTTPException(409, "A certificate payment is already in progress for this application")
+    return {"order_id": o["id"], "amount": paise, "key_id": RZP_KEY, "name": u.name, "email": u.email, "contact": u.mobile, "ref": info["ref"]}
 
 @app.post("/api/applications/{aid}/razorpay-verify")
 def rzp_verify(aid: int, b: RzpVerify, u: User = Depends(current), s: Session = Depends(db)):
-    own_app(s, u, aid, True)
-    p = s.query(Payment).filter(Payment.application_id == aid, Payment.utr.in_([b.razorpay_order_id, b.razorpay_payment_id])).first()
-    if not p or not rzp_sig_ok(f"{b.razorpay_order_id}|{b.razorpay_payment_id}", b.razorpay_signature, RZP_SECRET): raise HTTPException(400, "Payment verification failed")
-    if p.status != "Paid": mark_paid(s, p, b.razorpay_payment_id)
-    s.commit(); return {"ok": True}
-
-@app.post("/api/razorpay-webhook")  # optional safety net: unlocks the certificate even if the student closes the browser after paying
-async def rzp_hook(request: Request, s: Session = Depends(db)):
-    raw = await request.body()
-    if not rzp_sig_ok(raw.decode(), request.headers.get("x-razorpay-signature"), RZP_WH): raise HTTPException(400, "Bad signature")
-    ev = json.loads(raw); pl = ev.get("payload", {}); pay = (pl.get("payment") or {}).get("entity", {}); order = pay.get("order_id") or ((pl.get("order") or {}).get("entity", {}).get("id"))
-    if ev.get("event") in ("payment.captured", "order.paid") and order:
-        p = s.query(Payment).filter_by(utr=order, status="Created").first()
-        if p: mark_paid(s, p, pay.get("id", "")); s.commit()
+    own_app(s, u, aid, True); bad = HTTPException(400, "Payment verification failed")
+    if not (0 < len(b.razorpay_order_id) <= 60 and 0 < len(b.razorpay_payment_id) <= 60): raise bad
+    if not rzp_sig_ok(f"{b.razorpay_order_id}|{b.razorpay_payment_id}", b.razorpay_signature, RZP_SECRET): raise bad  # proves Razorpay confirmed this payment for this order
+    p = find_rzp_payment(s, b.razorpay_order_id, aid)  # the order must belong to THIS student's application
+    if not p or not is_rzp(p): raise bad
+    if p.status == "Paid":  # repeating the same confirmation is harmless; a different payment id for a paid order is not
+        if (p.rzp_payment_id or p.utr) == b.razorpay_payment_id: return {"ok": True}
+        raise HTTPException(409, "This order has already been paid")
+    if p.status not in ("Created", "Expired"): raise HTTPException(409, "This payment can no longer be confirmed")
+    try:
+        if not settle_paid(s, p, b.razorpay_payment_id):
+            s.rollback(); s.refresh(p)
+            if p.status == "Paid" and (p.rzp_payment_id or p.utr) == b.razorpay_payment_id: return {"ok": True}
+            raise HTTPException(409, "This payment can no longer be confirmed")
+        s.commit()
+    except IntegrityError: s.rollback(); raise HTTPException(409, "This payment has already been recorded")
     return {"ok": True}
 
-@app.get("/api/upi-qr.svg")
-def upi_qr(am: str = "", tn: str = "", s: Session = Depends(db)):
-    upi = setting(s, "upi_id")
-    if not upi or not qrcode: raise HTTPException(404, "UPI is not configured")
-    link = f"upi://pay?pa={quote(upi)}&pn={quote(setting(s, 'upi_name'))}&am={re.sub(r'[^0-9.]', '', am)}&cu=INR&tn={quote(tn[:40])}"
-    buf = io.BytesIO(); qrcode.make(link, image_factory=qrcode.image.svg.SvgPathImage).save(buf)
-    return Response(buf.getvalue(), media_type="image/svg+xml")
+def _hook_payment(s, ev, pay, order_id):
+    p = find_rzp_payment(s, order_id) if order_id else None
+    if not p or not is_rzp(p): return "no matching order"
+    if ev == "payment.failed":  # Razorpay lets the customer retry on the same order, so the order stays open
+        if p.status == "Created": p.note = ("Last attempt failed: " + str(pay.get("error_code") or "unknown"))[:200]; p.updated = dt.datetime.utcnow()
+        return "failed attempt recorded"
+    amt, cur = pay.get("amount"), pay.get("currency")
+    if amt != expected_paise(p) or cur != (p.currency or CURRENCY):  # never unlock a certificate for a different amount or currency
+        p.note = f"Webhook amount/currency mismatch ({amt} {cur})"[:200]
+        notify(s, "Payment mismatch", f"Razorpay reported {amt} {cur} for order {order_id}; expected {expected_paise(p)} {p.currency or CURRENCY}. Not unlocked.", admin_=True, link="payments"); return "mismatch"
+    return "paid" if settle_paid(s, p, pay.get("id", "")) else "already settled"
+
+def _hook_refund(s, rf):
+    p = s.query(Payment).filter(Payment.rzp_payment_id == rf.get("payment_id")).first() if rf.get("payment_id") else None
+    if not p: return "no matching payment"
+    p.refunded_paise = (p.refunded_paise or 0) + int(rf.get("amount") or 0); p.updated = dt.datetime.utcnow()
+    if p.refunded_paise >= expected_paise(p) and p.status == "Paid":  # fully refunded: the certificate locks again
+        p.status = "Refunded"; ap = s.get(Application, p.application_id)
+        notify(s, "Certificate payment refunded", "Your certificate payment was refunded, so the certificate is locked again.", user_id=ap.user_id, link=f"program/{ap.id}")
+        notify(s, "Certificate payment refunded", f"Payment {p.rzp_payment_id} was fully refunded in Razorpay.", admin_=True, link="payments")
+    return "refund recorded"
+
+@app.post("/api/razorpay-webhook")  # safety net: unlocks the certificate even if the student closes the browser after paying
+async def rzp_hook(request: Request, s: Session = Depends(db)):
+    if not RZP_WH: raise HTTPException(503, "Webhook is not configured")
+    raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES: raise HTTPException(413, "Payload too large")
+    if not rzp_sig_ok(raw, request.headers.get("x-razorpay-signature"), RZP_WH): raise HTTPException(400, "Bad signature")
+    try: ev = json.loads(raw); name = str(ev.get("event", "")); pl = ev.get("payload") or {}
+    except Exception: raise HTTPException(400, "Bad payload")
+    eid = (request.headers.get("x-razorpay-event-id") or hashlib.sha256(raw).hexdigest())[:80]
+    try:
+        s.add(WebhookEvent(event_id=eid, event=name[:60])); s.flush()  # a repeat delivery hits the unique key here and is acknowledged without being applied again
+    except IntegrityError:
+        s.rollback(); return {"ok": True, "duplicate": True}
+    try:
+        pay = (pl.get("payment") or {}).get("entity") or {}; order = pay.get("order_id") or ((pl.get("order") or {}).get("entity") or {}).get("id")
+        if name in ("payment.captured", "order.paid", "payment.failed"): res = _hook_payment(s, name, pay, order)
+        elif name == "refund.processed": res = _hook_refund(s, (pl.get("refund") or {}).get("entity") or {})
+        else: res = "ignored"
+        s.commit()
+    except Exception as e:
+        s.rollback(); paylog.error("Webhook %s failed: %s", name, type(e).__name__); raise HTTPException(500, "Webhook processing failed")  # not stored as processed, so Razorpay's retry works
+    if res in ("paid", "mismatch", "refund recorded"): log(s, "razorpay-webhook", f"{name}: {res}")
+    return {"ok": True}
 
 # ---------------- notifications ----------------
 def my_notes(u, s):
@@ -698,6 +1098,8 @@ def aedit(iid: int, b: Intern, a: User = Depends(admin), s: Session = Depends(db
 @app.delete("/api/admin/internships/{iid}")
 def adel(iid: int, a: User = Depends(admin), s: Session = Depends(db)):
     ids = [x.id for x in s.query(Application).filter_by(internship_id=iid)]
+    if ids and s.query(Payment).filter(Payment.application_id.in_(ids), Payment.status.in_(["Paid", "Refunded"])).count():
+        raise HTTPException(409, "Students have paid certificate fees for this internship, so it cannot be deleted. Unpublish it instead.")  # keeps financial records
     if ids:
         s.query(Submission).filter(Submission.application_id.in_(ids)).delete(synchronize_session=False)
         s.query(Payment).filter(Payment.application_id.in_(ids)).delete(synchronize_session=False)
@@ -818,7 +1220,7 @@ def areview_sub(sid: int, r: SubReview, a: User = Depends(admin), s: Session = D
 @app.get("/api/admin/payments")
 def apays(a: User = Depends(admin), s: Session = Depends(db)):
     out = []
-    for p in s.query(Payment).filter(Payment.status != "Created").order_by(Payment.id.desc()).limit(300):
+    for p in s.query(Payment).filter(Payment.status.notin_(["Created", "Expired"])).order_by(Payment.id.desc()).limit(300):
         ap = s.get(Application, p.application_id)
         out.append({**row(p), "student": s.get(User, ap.user_id).name, "email": s.get(User, ap.user_id).email, "internship": s.get(Internship, ap.internship_id).title, "months": ap.months})
     return out
@@ -827,38 +1229,81 @@ def areview_pay(pid: int, r: PayReview, a: User = Depends(admin), s: Session = D
     if r.status not in ("Paid", "Rejected"): raise HTTPException(400, "Bad status")
     p = s.get(Payment, pid)
     if not p: raise HTTPException(404, "Not found")
-    p.status, p.note = r.status, r.note; ap = s.get(Application, p.application_id)
+    if is_rzp(p): raise HTTPException(409, "Online payments are confirmed by Razorpay and cannot be changed here. Refunds are made in the Razorpay dashboard.")
+    if p.status != "Pending": raise HTTPException(409, "This payment has already been reviewed")
+    note = (r.note or "")[:500]
+    if s.query(Payment).filter(Payment.id == pid, Payment.status == "Pending").update({"status": r.status, "note": note, "updated": dt.datetime.utcnow()}, synchronize_session=False) != 1: raise HTTPException(409, "This payment has already been reviewed")
+    s.refresh(p); ap = s.get(Application, p.application_id)
     notify(s, "Certificate unlocked 🎓" if r.status == "Paid" else "Payment could not be verified",
-           "Your certificate is ready. Open your program to view and download it." if r.status == "Paid" else (r.note or "Please check your transaction number and pay again."),
+           "Your certificate is ready. Open your program to view and download it." if r.status == "Paid" else (note or "Please check your transaction number and pay again."),
            user_id=ap.user_id, link=f"program/{ap.id}")
     s.commit(); log(s, a.email, f"Payment {pid} -> {r.status}"); return row(p)
 @app.get("/api/admin/settings")
-def aset(a: User = Depends(admin), s: Session = Depends(db)): return {**{k: setting(s, k) for k in DEFAULTS}, "razorpay": rzp_on()}
+def aset(a: User = Depends(admin), s: Session = Depends(db)): return {**{k: setting(s, k) for k in DEFAULTS}, "razorpay": rzp_on(), "razorpay_mode": RZP_MODE, "razorpay_webhook": bool(RZP_WH)}
 @app.put("/api/admin/settings")
 def aset_save(b: Settings, a: User = Depends(admin), s: Session = Depends(db)):
     for k, v in b.dict(exclude_none=True).items():
         if k == "signature": v = clean_url(v) or "/static/signature.png"
+        elif k == "signature2": v = clean_url(v)
+        elif k in ("offer_pad_top", "offer_pad_bottom"): v = str(mm_val(v, 40 if k.endswith("top") else 20))
+        elif k == "upi_id": v = v.strip()
         r = s.get(Setting, k)
         if r: r.value = v
         else: s.add(Setting(key=k, value=v))
     s.commit(); log(s, a.email, "Updated settings"); return {k: setting(s, k) for k in DEFAULTS}
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS)), name="uploads")
+_APP_HTML = {}
 @app.get("/")
-def home(): return FileResponse("static/app.html")
+def home():
+    """Serves the app. If SUPPORT_EMAIL is set, the placeholder contact address in the Terms/Privacy/Help pages is replaced with it."""
+    email = os.getenv("SUPPORT_EMAIL", "").strip()
+    if not email or not re.fullmatch(r"[^@\s<>\"']+@[^@\s<>\"']+\.[^@\s<>\"']+", email): return FileResponse("static/app.html")
+    if email not in _APP_HTML: _APP_HTML.clear(); _APP_HTML[email] = open("static/app.html", encoding="utf-8").read().replace("admin@yourdomain.com", email)
+    return HTMLResponse(_APP_HTML[email])
 @app.get("/admin")
 def adm(): return FileResponse("static/admin.html")
+def policy_page(key, fallback):
+    """Standalone HTML version of an in-app policy page (Google Play wants a public, crawlable URL). Text is read from the same source
+    as the in-app page so the two cannot drift apart."""
+    try:
+        src = open("static/app.html", encoding="utf-8").read()
+        m = re.search(key + r":\['([^']*)',`(.*?)`\]", src, re.S)
+        sup = os.getenv("SUPPORT_EMAIL", "").strip()
+        if not re.fullmatch(r"[^@\s<>\"']+@[^@\s<>\"']+\.[^@\s<>\"']+", sup): sup = "admin@yourdomain.com"
+        body = m.group(2).replace("${SUP}", sup)
+        if not m or "${" in body: return RedirectResponse(fallback)
+        title = html.escape(m.group(1).replace("&amp;", "&"))
+        return HTMLResponse(f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} - UPNIVO INTERN</title>
+<style>*{{box-sizing:border-box}}body{{font:16px/1.6 system-ui,sans-serif;margin:0;padding:16px;background:#f4f7fb;color:#1b2430}}main{{max-width:760px;margin:0 auto;background:#fff;border-radius:16px;padding:24px;box-shadow:0 8px 24px rgba(20,32,61,.1)}}h1{{margin-top:0}}h5{{font-size:1.05rem;margin:20px 0 4px}}a{{color:#0b5fff}}a:focus-visible{{outline:3px solid #0b5fff}}</style></head>
+<body><main><h1>{title}</h1><p><small>UPNIVO INTERN (Upnivo) · Last updated 12 November 2026</small></p>{body}<p><a href="/">Back to UPNIVO INTERN</a></p></main></body></html>""")
+    except Exception: return RedirectResponse(fallback)
 @app.get("/privacy")
-def pg_privacy(): return RedirectResponse("/#info/privacy")
+def pg_privacy(): return policy_page("privacy", "/#info/privacy")
 @app.get("/terms")
-def pg_terms(): return RedirectResponse("/#info/terms")
+def pg_terms(): return policy_page("terms", "/#info/terms")
+@app.get("/refund")
+def pg_refund(): return policy_page("refund", "/#info/refund")
 @app.get("/delete-account")
 def pg_delete(): return RedirectResponse("/#info/delete")
-@app.get("/.well-known/assetlinks.json")  # lets the Play Store app open full screen (no browser bar)
+@app.get("/delete-account-request")
+def delete_account_request_page(): return FileResponse("static/delete-account-request.html")
+@app.get("/api/health")  # for Render / uptime monitors: confirms the app is up and the database answers. Exposes nothing else.
+def health(s: Session = Depends(db)):
+    try: s.execute(text("SELECT 1")); return {"status": "ok", "database": "ok"}
+    except Exception:
+        paylog.error("Health check: database unreachable"); return JSONResponse({"status": "degraded", "database": "error"}, status_code=503)
+
+FP_RE = re.compile(r"^([0-9A-F]{2}:){31}[0-9A-F]{2}$"); PKG_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$")
+@app.get("/.well-known/assetlinks.json")  # Digital Asset Links: lets the Play Store app open full screen (no browser bar)
 def assetlinks():
-    pkg, fp = os.getenv("ANDROID_PACKAGE", ""), [x.strip() for x in os.getenv("ANDROID_SHA256", "").split(",") if x.strip()]
-    return [{"relation": ["delegate_permission/common.handle_all_urls"], "target": {"namespace": "android_app", "package_name": pkg, "sha256_cert_fingerprints": fp}}] if pkg and fp else []
+    pkg = os.getenv("ANDROID_PACKAGE", "").strip()
+    raw = [x.strip().upper() for x in os.getenv("ANDROID_SHA256", "").split(",") if x.strip()]
+    fp = [x for x in raw if FP_RE.match(x)]
+    if len(fp) != len(raw): paylog.warning("Ignored %d malformed ANDROID_SHA256 value(s); expected 32 colon-separated hex bytes", len(raw) - len(fp))
+    if not (pkg and PKG_RE.match(pkg) and fp): return JSONResponse([], headers={"Cache-Control": "no-cache"})
+    return JSONResponse([{"relation": ["delegate_permission/common.handle_all_urls"], "target": {"namespace": "android_app", "package_name": pkg, "sha256_cert_fingerprints": fp}}], headers={"Cache-Control": "public, max-age=300"})
 @app.get("/sw.js")
 def sw(): return FileResponse("static/sw.js", media_type="application/javascript", headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
 @app.get("/manifest.webmanifest")

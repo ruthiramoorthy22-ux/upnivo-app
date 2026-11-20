@@ -1,7 +1,7 @@
 # UPNIVO INTERN
 ```
 pip install -r requirements.txt
-export ADMIN_PASSWORD='YourStrongPassword'   # creates skillforgelearning22@gmail.com as admin on first start
+export ADMIN_PASSWORD='YourStrongPassword'   # creates admin@yourdomain.com as admin on first start
 export SECRET_KEY='long-random-string'
 uvicorn main:app --reload
 ```
@@ -51,7 +51,7 @@ Tasks: Admin > Internships > Tasks > Edit (text, steps, image, study link, order
 - Tasks without a detailed explanation now show a clear "Goal / How to do it / What to submit" guide.
 
 ## Version 3.1
-- Admin login: skillforgelearning22@gmail.com (password in `.env` ADMIN_PASSWORD; default set in code). Logging in on the student page opens /admin.
+- Admin login: admin@yourdomain.com (password in `.env` ADMIN_PASSWORD). Logging in on the student page opens /admin.
 - Android: installable PWA (manifest.webmanifest, sw.js, icons). Open the deployed HTTPS site in Chrome > Install app. For a Play Store APK use PWABuilder.com.
 - Info pages: Terms, Privacy, Refund, Help/FAQ, About & Team (#info/terms etc.). Register needs agreement to Terms and Privacy.
 

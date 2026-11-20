@@ -3,3 +3,35 @@ venv/
 __pycache__/
 *.pyc
 *.db
+
+# Android signing material (Phase 8)
+*.keystore
+*.jks
+*.p12
+keystore.properties
+*.aab
+*.apk
+
+# Python test cache
+.pytest_cache/
+tests/__pycache__/
+
+# Android generated files
+android/.gradle/
+android/build/
+android/app/build/
+
+# Local user uploads - never commit
+uploads/
+
+# Temporary validation scripts
+admin-check-*.js
+admin-template-check*.js
+
+# Local backup files and folders
+*-backup-*/
+*.before-static-fix
+*.payment-backup
+*.template-backup
+static/*.before-*-fix
+static/*.template-backup
